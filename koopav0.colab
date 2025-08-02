@@ -1,0 +1,674 @@
+# Horizion Beta Koopatron 1.x - LLM Training Script for Google Colab
+# Author: Horizion Team
+# Version: 1.0
+# Last Updated: August 2, 2025
+
+# %% [markdown]
+# # 🚀 Horizion Beta Koopatron LLM Training
+# This notebook sets up and trains an LLM integrated with the Horizion asset extraction system.
+
+# %% [markdown]
+# ## 1. Environment Setup
+
+# %%
+# Check GPU availability
+import torch
+import subprocess
+import sys
+
+print("🔍 Checking system configuration...")
+print(f"Python version: {sys.version}")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+# %%
+# Install required dependencies
+print("📦 Installing dependencies...")
+
+!pip install -q --upgrade pip
+!pip install -q transformers==4.36.0
+!pip install -q accelerate==0.25.0
+!pip install -q datasets==2.16.0
+!pip install -q bitsandbytes==0.41.3
+!pip install -q peft==0.7.0
+!pip install -q trl==0.7.4
+!pip install -q wandb
+!pip install -q sentencepiece
+!pip install -q einops
+!pip install -q scipy
+!pip install -q pillow
+!pip install -q tqdm
+!pip install -q pandas
+!pip install -q numpy
+
+# Clone Horizion repository
+!git clone https://github.com/catsanzshftw/Horizion-Beta-Koopatron1.x.git
+!cd Horizion-Beta-Koopatron1.x && pip install -q -e .
+
+print("✅ Dependencies installed successfully!")
+
+# %% [markdown]
+# ## 2. Configuration and Imports
+
+# %%
+import os
+import json
+import time
+import random
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    AutoConfig
+)
+
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType
+)
+
+from accelerate import Accelerator
+from datasets import load_dataset, Dataset as HFDataset
+import wandb
+
+# Horizion imports
+sys.path.append('/content/Horizion-Beta-Koopatron1.x')
+try:
+    from horizion import Koopatron, AssetManager
+    from horizion.training import ASIDatasetGenerator
+    print("✅ Horizion modules loaded successfully!")
+except ImportError:
+    print("⚠️ Horizion modules not found, using mock implementation")
+    class Koopatron:
+        def __init__(self): pass
+        def extract(self, *args, **kwargs): return []
+        def convert(self, *args, **kwargs): return []
+    class AssetManager:
+        def __init__(self): pass
+
+# %%
+# Configuration class
+class HorizionConfig:
+    def __init__(self):
+        # Model configuration
+        self.model_name = "mistralai/Mistral-7B-v0.1"  # Base model
+        self.use_4bit = True  # Enable 4-bit quantization
+        self.use_lora = True   # Enable LoRA fine-tuning
+        
+        # Training configuration
+        self.batch_size = 4
+        self.gradient_accumulation_steps = 4
+        self.learning_rate = 2e-4
+        self.num_epochs = 3
+        self.max_seq_length = 2048
+        self.warmup_steps = 100
+        
+        # LoRA configuration
+        self.lora_r = 16
+        self.lora_alpha = 32
+        self.lora_dropout = 0.1
+        self.lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+        
+        # Paths
+        self.output_dir = "/content/horizion_models"
+        self.cache_dir = "/content/cache"
+        self.dataset_path = "/content/datasets"
+        
+        # Logging
+        self.use_wandb = True
+        self.project_name = "horizion-koopatron-llm"
+        self.run_name = f"horizion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+config = HorizionConfig()
+os.makedirs(config.output_dir, exist_ok=True)
+os.makedirs(config.cache_dir, exist_ok=True)
+os.makedirs(config.dataset_path, exist_ok=True)
+
+print("⚙️ Configuration loaded!")
+
+# %% [markdown]
+# ## 3. Dataset Preparation
+
+# %%
+class HorizionDataset(Dataset):
+    """Custom dataset for Horizion asset-based training"""
+    
+    def __init__(self, data_path: str, tokenizer, max_length: int = 2048):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.data = self._load_data(data_path)
+        
+    def _load_data(self, path: str) -> List[Dict]:
+        """Load and prepare training data"""
+        data = []
+        
+        # Load from JSON files
+        json_files = Path(path).glob("*.json")
+        for file in json_files:
+            with open(file, 'r') as f:
+                data.extend(json.load(f))
+        
+        # Process asset descriptions
+        koopatron = Koopatron()
+        for item in data:
+            if 'asset_path' in item:
+                # Extract metadata from assets
+                assets = koopatron.extract(item['asset_path'])
+                item['asset_metadata'] = str(assets)
+        
+        return data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # Format prompt for training
+        prompt = self._format_prompt(item)
+        
+        # Tokenize
+        encoded = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": encoded["input_ids"].squeeze(),
+            "attention_mask": encoded["attention_mask"].squeeze(),
+            "labels": encoded["input_ids"].squeeze()
+        }
+    
+    def _format_prompt(self, item: Dict) -> str:
+        """Format data item into training prompt"""
+        if 'instruction' in item and 'response' in item:
+            return f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['response']}"
+        elif 'text' in item:
+            return item['text']
+        else:
+            return str(item)
+
+# %%
+# Generate synthetic training data
+def generate_training_data():
+    """Generate synthetic training data for demonstration"""
+    print("🔄 Generating synthetic training data...")
+    
+    training_examples = [
+        {
+            "instruction": "Extract textures from a Unity game file",
+            "response": "To extract textures from Unity games, use Koopatron's Unity extractor module..."
+        },
+        {
+            "instruction": "Convert PNG assets to WebP format with AI enhancement",
+            "response": "Using Horizion's AI-powered conversion: koopatron.convert(assets, format='webp', ai_enhance=True)..."
+        },
+        {
+            "instruction": "Generate ASI training dataset from game assets",
+            "response": "The ASI dataset generation process involves: 1) Asset extraction, 2) Metadata enrichment, 3) Format standardization..."
+        },
+        # Add more examples as needed
+    ]
+    
+    # Save to JSON
+    output_file = f"{config.dataset_path}/training_data.json"
+    with open(output_file, 'w') as f:
+        json.dump(training_examples, f, indent=2)
+    
+    print(f"✅ Generated {len(training_examples)} training examples")
+    return output_file
+
+training_data_path = generate_training_data()
+
+# %% [markdown]
+# ## 4. Model Initialization
+
+# %%
+def setup_model_and_tokenizer():
+    """Initialize model with 4-bit quantization and LoRA"""
+    print("🤖 Loading model and tokenizer...")
+    
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name,
+        cache_dir=config.cache_dir,
+        trust_remote_code=True
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    
+    # 4-bit quantization config
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True
+        )
+    else:
+        bnb_config = None
+    
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        quantization_config=bnb_config,
+        cache_dir=config.cache_dir,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16
+    )
+    
+    # Prepare for k-bit training
+    if config.use_4bit:
+        model = prepare_model_for_kbit_training(model)
+    
+    # Add LoRA
+    if config.use_lora:
+        lora_config = LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    
+    return model, tokenizer
+
+model, tokenizer = setup_model_and_tokenizer()
+
+# %% [markdown]
+# ## 5. Training Pipeline
+
+# %%
+class HorizionTrainer:
+    """Custom trainer with Horizion integration"""
+    
+    def __init__(self, model, tokenizer, config):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.config = config
+        self.accelerator = Accelerator()
+        
+        # Initialize wandb
+        if config.use_wandb:
+            wandb.init(
+                project=config.project_name,
+                name=config.run_name,
+                config=vars(config)
+            )
+    
+    def prepare_dataset(self, data_path: str):
+        """Prepare dataset for training"""
+        dataset = HorizionDataset(data_path, self.tokenizer, self.config.max_seq_length)
+        
+        # Split into train/eval
+        train_size = int(0.9 * len(dataset))
+        eval_size = len(dataset) - train_size
+        
+        train_dataset, eval_dataset = torch.utils.data.random_split(
+            dataset, [train_size, eval_size]
+        )
+        
+        return train_dataset, eval_dataset
+    
+    def train(self, train_dataset, eval_dataset):
+        """Main training loop"""
+        print("🏋️ Starting training...")
+        
+        # Training arguments
+        training_args = TrainingArguments(
+            output_dir=self.config.output_dir,
+            num_train_epochs=self.config.num_epochs,
+            per_device_train_batch_size=self.config.batch_size,
+            per_device_eval_batch_size=self.config.batch_size,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            warmup_steps=self.config.warmup_steps,
+            learning_rate=self.config.learning_rate,
+            fp16=True,
+            logging_steps=10,
+            evaluation_strategy="steps",
+            eval_steps=50,
+            save_strategy="epoch",
+            save_total_limit=2,
+            load_best_model_at_end=True,
+            report_to="wandb" if self.config.use_wandb else "none",
+            remove_unused_columns=False,
+        )
+        
+        # Data collator
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer,
+            mlm=False
+        )
+        
+        # Initialize trainer
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            tokenizer=self.tokenizer,
+        )
+        
+        # Train
+        trainer.train()
+        
+        # Save model
+        trainer.save_model(f"{self.config.output_dir}/final_model")
+        self.tokenizer.save_pretrained(f"{self.config.output_dir}/final_model")
+        
+        print("✅ Training completed!")
+        
+        return trainer
+
+# %%
+# Initialize trainer
+trainer = HorizionTrainer(model, tokenizer, config)
+
+# Prepare datasets
+train_dataset, eval_dataset = trainer.prepare_dataset(config.dataset_path)
+
+print(f"📊 Dataset sizes - Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
+
+# %% [markdown]
+# ## 6. Training Execution
+
+# %%
+# Start training
+# Note: Comment out this cell if you want to skip training
+if len(train_dataset) > 0:
+    trained_model = trainer.train(train_dataset, eval_dataset)
+else:
+    print("⚠️ No training data found. Skipping training.")
+
+# %% [markdown]
+# ## 7. Inference and Testing
+
+# %%
+def generate_response(prompt: str, model, tokenizer, max_length: int = 512):
+    """Generate response from the model"""
+    # Encode prompt
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    
+    # Generate
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_length,
+            temperature=0.7,
+            do_sample=True,
+            top_p=0.95,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    # Decode
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response
+
+# Test the model
+test_prompts = [
+    "### Instruction:\nHow do I extract 3D models from a game?\n\n### Response:\n",
+    "### Instruction:\nExplain the ASI dataset format\n\n### Response:\n",
+    "### Instruction:\nConvert audio assets to different formats\n\n### Response:\n"
+]
+
+print("🧪 Testing model responses:")
+for i, prompt in enumerate(test_prompts):
+    print(f"\n--- Test {i+1} ---")
+    print(f"Prompt: {prompt[:50]}...")
+    response = generate_response(prompt, model, tokenizer)
+    print(f"Response: {response}")
+
+# %% [markdown]
+# ## 8. Export for ASI Training
+
+# %%
+class ASIExporter:
+    """Export model and datasets for ASI training"""
+    
+    def __init__(self, model, tokenizer, config):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.config = config
+    
+    def export_model_for_asi(self, output_path: str):
+        """Export model in ASI-compatible format"""
+        print("📤 Exporting model for ASI training...")
+        
+        asi_export_dir = f"{output_path}/asi_export"
+        os.makedirs(asi_export_dir, exist_ok=True)
+        
+        # Save model weights
+        if hasattr(self.model, 'save_pretrained'):
+            self.model.save_pretrained(f"{asi_export_dir}/model")
+        else:
+            torch.save(self.model.state_dict(), f"{asi_export_dir}/model/pytorch_model.bin")
+        
+        # Save tokenizer
+        self.tokenizer.save_pretrained(f"{asi_export_dir}/tokenizer")
+        
+        # Create ASI metadata
+        asi_metadata = {
+            "model_type": "causal_lm",
+            "base_model": self.config.model_name,
+            "training_framework": "horizion_koopatron",
+            "version": "1.0",
+            "created_date": datetime.now().isoformat(),
+            "parameters": {
+                "max_seq_length": self.config.max_seq_length,
+                "vocab_size": self.tokenizer.vocab_size,
+                "hidden_size": self.model.config.hidden_size if hasattr(self.model, 'config') else None,
+                "num_layers": self.model.config.num_hidden_layers if hasattr(self.model, 'config') else None,
+            },
+            "training_config": vars(self.config),
+            "capabilities": [
+                "asset_extraction",
+                "format_conversion",
+                "ai_enhancement",
+                "code_generation"
+            ]
+        }
+        
+        with open(f"{asi_export_dir}/asi_metadata.json", 'w') as f:
+            json.dump(asi_metadata, f, indent=2)
+        
+        print(f"✅ Model exported to {asi_export_dir}")
+        return asi_export_dir
+    
+    def create_asi_dataset(self, data_path: str, output_path: str):
+        """Create ASI-compatible training dataset"""
+        print("📊 Creating ASI training dataset...")
+        
+        koopatron = Koopatron()
+        asi_dataset = []
+        
+        # Process existing data
+        for file in Path(data_path).glob("*.json"):
+            with open(file, 'r') as f:
+                data = json.load(f)
+                
+            for item in data:
+                asi_entry = {
+                    "id": f"horizion_{len(asi_dataset)}",
+                    "type": "instruction_response",
+                    "source": "horizion_koopatron",
+                    "content": item,
+                    "metadata": {
+                        "created": datetime.now().isoformat(),
+                        "version": "1.0"
+                    }
+                }
+                asi_dataset.append(asi_entry)
+        
+        # Save ASI dataset
+        output_file = f"{output_path}/asi_training_dataset.json"
+        with open(output_file, 'w') as f:
+            json.dump(asi_dataset, f, indent=2)
+        
+        print(f"✅ ASI dataset created with {len(asi_dataset)} entries")
+        return output_file
+
+# Export for ASI
+exporter = ASIExporter(model, tokenizer, config)
+asi_model_path = exporter.export_model_for_asi(config.output_dir)
+asi_dataset_path = exporter.create_asi_dataset(config.dataset_path, config.output_dir)
+
+# %% [markdown]
+# ## 9. Model Deployment
+
+# %%
+# Create deployment package
+def create_deployment_package():
+    """Create a deployment-ready package"""
+    print("📦 Creating deployment package...")
+    
+    deploy_dir = f"{config.output_dir}/horizion_deploy"
+    os.makedirs(deploy_dir, exist_ok=True)
+    
+    # Create inference script
+    inference_script = '''
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+class HorizionInference:
+    def __init__(self, model_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        self.model.eval()
+    
+    def generate(self, prompt, max_length=512):
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_length,
+                temperature=0.7,
+                do_sample=True
+            )
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# Usage
+if __name__ == "__main__":
+    horizion = HorizionInference("./model")
+    response = horizion.generate("Extract assets from Unity game:")
+    print(response)
+'''
+    
+    with open(f"{deploy_dir}/inference.py", 'w') as f:
+        f.write(inference_script)
+    
+    # Create requirements file
+    requirements = '''
+torch>=2.0.0
+transformers>=4.36.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+'''
+    
+    with open(f"{deploy_dir}/requirements.txt", 'w') as f:
+        f.write(requirements)
+    
+    # Create README
+    readme = f'''
+# Horizion Koopatron LLM Deployment
+
+## Quick Start
+1. Install dependencies: `pip install -r requirements.txt`
+2. Run inference: `python inference.py`
+
+## Model Info
+- Base Model: {config.model_name}
+- Training Date: {datetime.now().strftime("%Y-%m-%d")}
+- Capabilities: Asset extraction, format conversion, AI enhancement
+
+## API Usage
+```python
+from inference import HorizionInference
+model = HorizionInference("./model")
+response = model.generate("Your prompt here")
+```
+'''
+    
+    with open(f"{deploy_dir}/README.md", 'w') as f:
+        f.write(readme)
+    
+    print(f"✅ Deployment package created at {deploy_dir}")
+    
+    # Create zip archive
+    !cd {config.output_dir} && zip -r horizion_deploy.zip horizion_deploy/
+    print("📦 Deployment package zipped!")
+
+create_deployment_package()
+
+# %% [markdown]
+# ## 10. Cleanup and Summary
+
+# %%
+# Summary report
+print("\n" + "="*50)
+print("🎉 HORIZION KOOPATRON LLM TRAINING COMPLETE")
+print("="*50)
+print(f"\n📊 Training Summary:")
+print(f"- Model: {config.model_name}")
+print(f"- Training epochs: {config.num_epochs}")
+print(f"- Final model location: {config.output_dir}/final_model")
+print(f"- ASI export location: {asi_model_path}")
+print(f"- Deployment package: {config.output_dir}/horizion_deploy.zip")
+
+# Memory cleanup
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print(f"\n💾 GPU Memory freed")
+
+# Close wandb
+if config.use_wandb:
+    wandb.finish()
+    print("📊 W&B run completed")
+
+print("\n✅ All tasks completed successfully!")
+print("\n🚀 Next steps:")
+print("1. Download the model from the output directory")
+print("2. Test the model with your own prompts")
+print("3. Deploy using the deployment package")
+print("4. Share your results with the Horizion community!")
+
+# %%
+# Optional: Download trained model
+from google.colab import files
+
+# Uncomment to download the deployment package
+# files.download(f"{config.output_dir}/horizion_deploy.zip")
+
+print("💾 To download the model, uncomment the line above and run this cell")
